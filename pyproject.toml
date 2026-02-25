@@ -1,0 +1,13 @@
+[project]
+name = "claudehopper"
+version = "0.1.0"
+description = "Bidirectional bridge between CLI Claude and browser Claude"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+meridian = [
+    "meridian",
+]
