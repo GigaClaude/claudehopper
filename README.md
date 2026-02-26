@@ -60,6 +60,24 @@ python -m claudehopper.comms read
 python -m claudehopper.comms new    # only unread messages
 ```
 
+### Bridge — inject memory API into browser
+
+Connects to the executor and injects `window._meridian` into the browser tab, giving browser Claude direct access to recall, remember, briefing, and messaging APIs.
+
+```bash
+python -m claudehopper.bridge                                    # start bridge
+python -m claudehopper.bridge --meridian-url http://localhost:7891
+```
+
+### Meridian Bridge — full memory + messaging proxy
+
+Injects `window.meridian` and `window.bridge` into the browser. Proxies memory operations to the Meridian REST API via executor events, and auto-executes `meridian_cmd` JSON blocks from chat.
+
+```bash
+python -m claudehopper.meridian_bridge              # start daemon
+python -m claudehopper.meridian_bridge --inject     # just inject JS, exit
+```
+
 ### Relay — bridge Meridian memory commands
 
 If browser Claude emits `meridian_cmd` JSON blocks in its messages, the relay picks them up and executes them against a local [Meridian](https://github.com/GigaClaude/meridian) instance.
@@ -88,6 +106,8 @@ claudehopper/
 ├── executor/         # WebSocket client for browser automation
 │   ├── client.py     # ExecutorClient — exec JS, navigate, events
 │   └── config.py     # Connection config from env vars
+├── bridge.py         # ClaudeHopperBridge — inject memory API, poll messages
+├── meridian_bridge.py # Full memory proxy + DOM command watcher
 ├── comms.py          # BrowserComms — reliable send/receive with dedup
 ├── chat.py           # Interactive chat CLI
 └── relay.py          # Meridian command relay
