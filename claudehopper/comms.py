@@ -92,6 +92,46 @@ return JSON.stringify({{ok: true, preview: e.textContent.slice(0, 80)}});
 """
 
 
+def _make_insert_and_send_js(message: str) -> str:
+    """JS to insert text AND click send in one shot with retry.
+
+    Combines insert + send into a single exec call to avoid the race
+    condition where the send button isn't ready between two separate calls.
+    """
+    safe = json.dumps(message)
+    return f"""
+const e = document.querySelector("div.ProseMirror");
+if (!e) return JSON.stringify({{ok: false, error: "no editor"}});
+e.focus();
+document.execCommand("selectAll");
+document.execCommand("delete");
+document.execCommand("insertText", false, {safe});
+
+// Wait for ProseMirror to process and enable the send button
+const findBtn = () => document.querySelector('button[aria-label="Send message"]')
+    || document.querySelector('button[aria-label="Send Message"]');
+
+let attempts = 0;
+while (attempts < 20) {{
+    await new Promise(r => setTimeout(r, 150));
+    const b = findBtn();
+    if (b && !b.disabled) {{
+        b.click();
+        return JSON.stringify({{ok: true, sent: true, preview: e.textContent.slice(0, 80)}});
+    }}
+    attempts++;
+}}
+
+// Button never became available — text is in editor but not sent
+const b = findBtn();
+return JSON.stringify({{
+    ok: true, sent: false,
+    error: b ? (b.disabled ? "button stayed disabled" : "unknown") : "no button found",
+    preview: e.textContent.slice(0, 80)
+}});
+"""
+
+
 CLICK_SEND_JS = """
 const b = document.querySelector('button[aria-label="Send message"]')
        || document.querySelector('button[aria-label="Send Message"]');
@@ -174,7 +214,12 @@ class BrowserComms:
         return new_msgs
 
     async def send(self, message: str) -> bool:
-        """Send a message. Returns True on success."""
+        """Send a message. Returns True on success.
+
+        Uses a combined insert+send JS to avoid the race condition where
+        the send button isn't ready between two separate exec calls.
+        Falls back to two-step if the combined approach fails.
+        """
         msg_hash = _hash(message)
 
         recent_hashes = self.state.get("sent_hashes", [])
@@ -182,7 +227,10 @@ class BrowserComms:
             _log(f"Dedup: message already sent (hash={msg_hash})")
             return False
 
-        result_raw = await self.client.exec(_make_send_js(message), timeout=5)
+        # Try combined insert+send (avoids race condition)
+        result_raw = await self.client.exec(
+            _make_insert_and_send_js(message), timeout=10,
+        )
         try:
             result = json.loads(result_raw) if result_raw else {"ok": False, "error": "no response"}
         except (json.JSONDecodeError, TypeError):
@@ -192,8 +240,16 @@ class BrowserComms:
             _log(f"Insert failed: {result.get('error')}")
             return False
 
-        _log(f"Text inserted: {result.get('preview', '')}")
-        await asyncio.sleep(0.8)
+        if result.get("sent"):
+            _log(f"Sent (combined): {result.get('preview', '')}")
+            recent_hashes.append(msg_hash)
+            self.state["sent_hashes"] = recent_hashes[-20:]
+            _save_state(self.state)
+            return True
+
+        # Combined insert worked but send didn't fire — fallback to separate click
+        _log(f"Text inserted, send pending: {result.get('error', 'retrying click')}")
+        await asyncio.sleep(0.5)
 
         send_raw = await self.client.exec(CLICK_SEND_JS, timeout=5)
         try:
@@ -203,13 +259,14 @@ class BrowserComms:
 
         if not send_result.get("ok"):
             _log(f"Send click failed: {send_result.get('error')}")
+            _log("Text is in editor — may need manual send")
             return False
 
         recent_hashes.append(msg_hash)
         self.state["sent_hashes"] = recent_hashes[-20:]
         _save_state(self.state)
 
-        _log(f"Sent: {message[:60]}...")
+        _log(f"Sent (fallback): {message[:60]}...")
         return True
 
     async def wait_for_response(self, timeout: int = 120, poll_interval: float = 3.0) -> str | None:
