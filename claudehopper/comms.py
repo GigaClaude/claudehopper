@@ -122,7 +122,21 @@ while (attempts < 20) {{
     attempts++;
 }}
 
-// Button never became available — text is in editor but not sent
+// Button click failed — try Enter key on the editor as fallback
+// Many chat UIs submit on Enter, bypassing the button entirely
+e.focus();
+e.dispatchEvent(new KeyboardEvent("keydown", {{
+    key: "Enter", code: "Enter", keyCode: 13, which: 13,
+    bubbles: true, cancelable: true
+}}));
+await new Promise(r => setTimeout(r, 300));
+
+// Check if the text was cleared (indicating submit worked)
+if (!e.textContent || e.textContent.trim().length === 0) {{
+    return JSON.stringify({{ok: true, sent: true, method: "enter_key", preview: ""}});
+}}
+
+// Neither button nor Enter worked
 const b = findBtn();
 return JSON.stringify({{
     ok: true, sent: false,
@@ -135,10 +149,26 @@ return JSON.stringify({{
 CLICK_SEND_JS = """
 const b = document.querySelector('button[aria-label="Send message"]')
        || document.querySelector('button[aria-label="Send Message"]');
-if (!b) return JSON.stringify({ok: false, error: "no button"});
-if (b.disabled) return JSON.stringify({ok: false, error: "disabled"});
-b.click();
-return JSON.stringify({ok: true});
+if (b && !b.disabled) {
+    b.click();
+    return JSON.stringify({ok: true, method: "button"});
+}
+
+// Fallback: try Enter key on editor
+const e = document.querySelector("div.ProseMirror");
+if (e) {
+    e.focus();
+    e.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter", code: "Enter", keyCode: 13, which: 13,
+        bubbles: true, cancelable: true
+    }));
+    await new Promise(r => setTimeout(r, 300));
+    if (!e.textContent || e.textContent.trim().length === 0) {
+        return JSON.stringify({ok: true, method: "enter_key"});
+    }
+}
+
+return JSON.stringify({ok: false, error: b ? (b.disabled ? "disabled" : "click failed") : "no button"});
 """
 
 
