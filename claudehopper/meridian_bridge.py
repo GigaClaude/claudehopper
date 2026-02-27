@@ -597,29 +597,11 @@ async def channel_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
                            meridian_url: str, poll_interval: float = 3.0):
     """Poll the IRC channel for new messages and push them to Webbie's browser.
 
-    This bridges the gap between the IRC channel (Meridian web server) and
-    Webbie's browser tab. Without this, channel messages only go to WebSocket
-    subscribers on the channel.html page — Webbie never sees them.
-
-    Uses a persistent BrowserComms connection to avoid reconnecting per message.
+    Delivers via bridge._receive() (inbox, non-destructive) instead of
+    ProseMirror write (which stomps whatever Webbie is typing).
     """
-    last_ts: float = time.time()  # Only forward messages after we start
-    send_lock = asyncio.Lock()
-    comms: BrowserComms | None = None
+    last_ts: float = time.time()
     logger.info(f"Channel watcher started (polling every {poll_interval}s, since ts={last_ts:.0f})")
-
-    async def get_comms() -> BrowserComms:
-        """Get or create a persistent BrowserComms connection."""
-        nonlocal comms
-        if comms is None or comms.client is None or not comms.client.connected:
-            if comms:
-                try:
-                    await comms.close()
-                except Exception:
-                    pass
-            comms = BrowserComms()
-            await comms.connect()
-        return comms
 
     while True:
         try:
@@ -646,20 +628,17 @@ async def channel_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
                         last_ts = ts
                     continue
 
-                # Deliver to Webbie's chat via ProseMirror (actually visible)
+                # Deliver to Webbie's bridge inbox (non-destructive, no input stomping)
                 relay_msg = f"[#{sender}] {content}"
                 try:
-                    async with send_lock:
-                        c = await get_comms()
-                        ok = await c.send(relay_msg)
-                    if ok:
-                        logger.info(f"[CHANNEL->CHAT] {sender}: {content[:60]}")
-                    else:
-                        logger.warning(f"[CHANNEL->CHAT] Send returned False for: {content[:60]}")
+                    msg_escaped = json.dumps(relay_msg)
+                    await client.exec(
+                        f"if(window.bridge){{window.bridge._receive({{from:'{sender}',content:{msg_escaped},type:'channel'}})}}",
+                        timeout=5,
+                    )
+                    logger.info(f"[CHANNEL->INBOX] {sender}: {content[:60]}")
                 except Exception as e:
-                    logger.warning(f"[CHANNEL->CHAT] Failed: {e}")
-                    # Force reconnect on next attempt
-                    comms = None
+                    logger.warning(f"[CHANNEL->INBOX] Failed: {e}")
 
                 if ts > last_ts:
                     last_ts = ts
