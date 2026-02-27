@@ -8,3 +8,8 @@ build/
 *.pem
 *.key
 .claudehopper/
+.comms_state.json
+comms.log
+events.log
+__pycache__/
+*.pyc

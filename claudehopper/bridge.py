@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("claudehopper.bridge")
 
-MERIDIAN_URL = os.environ.get("MERIDIAN_URL", "http://localhost:7891")
+MERIDIAN_URL = os.environ.get("MERIDIAN_URL", "http://localhost:18101")
 
 # JavaScript injected into browser tab.
 # Creates window._meridian with recall(), remember(), send(), poll().

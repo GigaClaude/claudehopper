@@ -25,7 +25,7 @@ from .comms import BrowserComms
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("claudehopper.meridian_bridge")
 
-MERIDIAN_URL = os.environ.get("MERIDIAN_URL", "http://localhost:7891")
+MERIDIAN_URL = os.environ.get("MERIDIAN_URL", "http://localhost:18101")
 
 # JavaScript injected into browser context
 INIT_JS = r"""
