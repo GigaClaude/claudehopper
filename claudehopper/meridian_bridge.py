@@ -439,7 +439,7 @@ async def handle_cmd_event(client: ExecutorClient, http: aiohttp.ClientSession,
             result_json = json.dumps({"type": "meridian_result", "result": result}, default=str)
             result_escaped = result_json.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
             await client.exec(
-                f"if(window.tb){{window.tb.queueMsg('[meridian] '+{json.dumps(result[:1500])})}}",
+                f"console.log('[cmd] meridian result:', {json.dumps(result[:1500])})",
                 timeout=5,
             )
 
@@ -466,7 +466,32 @@ async def handle_cmd_event(client: ExecutorClient, http: aiohttp.ClientSession,
             logger.info(f"[CMD] bash_cmd exit={exit_code}, {len(output)} chars")
             result_msg = f"[bash exit={exit_code}] {output}"
             await client.exec(
-                f"if(window.tb){{window.tb.queueMsg({json.dumps(result_msg[:2000])})}}",
+                f"console.log('[cmd] bash result:', {json.dumps(result_msg[:2000])})",
+                timeout=5,
+            )
+
+        elif "ping" in cmd_data:
+            # Webbie pings Giga's side — return latest channel msg# as sanity check
+            try:
+                async with http.get(
+                    f"{meridian_url}/api/channel/history",
+                    params={"limit": "1"},
+                ) as resp:
+                    data = await resp.json()
+                msgs = data.get("messages", [])
+                latest = msgs[-1] if msgs else {}
+                count = data.get("count", len(msgs))
+                result = json.dumps({
+                    "pong": True,
+                    "channel_msgs": count,
+                    "latest_sender": latest.get("sender", ""),
+                    "latest_preview": latest.get("content", "")[:80],
+                }, default=str)
+            except Exception as e:
+                result = json.dumps({"pong": True, "error": str(e)})
+            logger.info(f"[CMD] ping -> {result[:120]}")
+            await client.exec(
+                f"console.log('[cmd] ping result:', {json.dumps(result)})",
                 timeout=5,
             )
 
@@ -488,16 +513,12 @@ async def handle_cmd_event(client: ExecutorClient, http: aiohttp.ClientSession,
 
 async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
                                meridian_url: str, poll_interval: float = 15.0):
-    """Poll chat DOM for new assistant messages. Two jobs:
-    1. Auto-execute meridian_cmd JSON blocks (existing behavior)
-    2. Auto-relay ALL new Webbie assistant text to the IRC channel verbatim
-    """
+    """Poll chat DOM for new assistant messages containing meridian_cmd JSON blocks."""
     processed_cmds: set[str] = set()
-    relayed_hashes: set[str] = set()  # Track which assistant messages we've relayed
     send_lock = asyncio.Lock()
     logger.info(f"DOM command watcher started (polling every {poll_interval}s)")
 
-    # Snapshot existing DOM — mark all current messages as already seen
+    # Snapshot existing DOM — mark all current commands as already processed
     try:
         raw = await client.exec(_READ_CHAT_JS, timeout=10)
         if raw:
@@ -506,14 +527,10 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                 if msg.get("role") != "assistant":
                     continue
                 text = msg.get("text", "")
-                # Mark all existing assistant messages as already relayed
-                msg_hash = hashlib.md5(text[:500].encode()).hexdigest()
-                relayed_hashes.add(msg_hash)
-                # Mark all existing commands as processed
                 for match in _CMD_RE.finditer(text):
                     cmd_hash = hashlib.md5(match.group().encode()).hexdigest()
                     processed_cmds.add(cmd_hash)
-            logger.info(f"[DOM-CMD] Baseline: {len(processed_cmds)} cmds, {len(relayed_hashes)} msgs marked seen")
+            logger.info(f"[DOM-CMD] Baseline: {len(processed_cmds)} cmds marked seen")
     except Exception as e:
         logger.warning(f"[DOM-CMD] Failed to snapshot baseline: {e}")
 
@@ -536,9 +553,7 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                     continue
 
                 text = msg.get("text", "")
-                msg_hash = hashlib.md5(text[:500].encode()).hexdigest()
 
-                # --- Job 1: Auto-execute meridian_cmd JSON blocks ---
                 for match in _CMD_RE.finditer(text):
                     cmd_str = match.group()
                     cmd_hash = hashlib.md5(cmd_str.encode()).hexdigest()
@@ -574,60 +589,6 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                             logger.warning(f"[DOM-CMD] Failed to send result: {e}")
 
                     processed_cmds.add(cmd_hash)
-
-                # --- Job 2: Auto-relay new assistant text to channel ---
-                if msg_hash in relayed_hashes:
-                    continue
-
-                # Don't relay messages that are still streaming (partial/garbled text)
-                if msg.get("streaming"):
-                    continue
-
-                relayed_hashes.add(msg_hash)
-
-                # Skip our own injected relay results
-                if text.startswith("[AUTO-RELAY]") or text.startswith("[#"):
-                    continue
-
-                # Skip very short or empty messages
-                if len(text.strip()) < 10:
-                    continue
-
-                # Skip messages that are ONLY meridian_cmd JSON blocks (no natural text)
-                text_without_cmds = _CMD_RE.sub("", text).strip()
-                if len(text_without_cmds) < 10:
-                    continue
-
-                # Skip DOM artifacts: claude.ai "thinking" indicators that leak through scraping
-                # These appear as repeated "Thinking about ..." phrases in the raw DOM text
-                if text_without_cmds.startswith("Thinking about "):
-                    continue
-
-                # Skip messages that look like garbled DOM scrapes (repeated phrases)
-                # Heuristic: if a 30-char prefix appears 2+ times, it's a scrape artifact
-                prefix = text_without_cmds[:30]
-                if len(prefix) >= 20 and text_without_cmds.count(prefix) >= 2:
-                    logger.debug(f"[WEBBIE->CHANNEL] Skipped garbled scrape: {prefix}...")
-                    continue
-
-                # Relay the cleaned text to channel as webbie
-                relay_text = text_without_cmds[:4000]  # Cap at 4k chars
-                try:
-                    async with http.post(
-                        f"{meridian_url}/api/channel/send",
-                        json={"sender": "webbie", "content": relay_text},
-                    ) as resp:
-                        data = await resp.json()
-                        logger.info(f"[WEBBIE->CHANNEL] Relayed {len(relay_text)} chars (msg #{data.get('count', '?')})")
-                except Exception as e:
-                    logger.warning(f"[WEBBIE->CHANNEL] Relay failed: {e}")
-
-            # Prevent unbounded memory growth
-            if len(relayed_hashes) > 200:
-                # Keep only last 100
-                excess = len(relayed_hashes) - 100
-                for _ in range(excess):
-                    relayed_hashes.pop()
 
         except Exception as e:
             logger.error(f"DOM watcher error: {e}")
