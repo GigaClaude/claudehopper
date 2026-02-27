@@ -404,15 +404,12 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
 
         except Exception as e:
             logger.error(f"DOM watcher error: {e}")
-            # Any error likely means dead connection — force reconnect
-            if "close frame" in str(e) or "not connected" in str(e).lower() or not client.connected:
+            if not client.connected:
                 logger.info("[DOM-CMD] Connection dead, forcing reconnect...")
                 try:
                     await client.close()
                 except Exception:
                     pass
-                client.ws = None
-                client.connected = False
                 try:
                     await client.connect()
                     await client.exec(INIT_JS, timeout=5)

@@ -3,15 +3,19 @@
 Executes JavaScript in a remote browser via a WebSocket bridge.
 The executor server runs a browser extension that receives JS,
 executes it, and returns results.
+
+Uses aiohttp for WebSocket transport — concurrent-safe for multiple
+coroutines sharing one connection (DOM watcher, channel watcher, etc.).
 """
 
 import json
 import uuid
 import logging
 import asyncio
+import ssl as sslmod
 from urllib.parse import urlparse
 
-import websockets
+import aiohttp
 
 import typing as tp
 
@@ -90,7 +94,11 @@ _CONSOLE_TAP_JS: str = r"""
 
 
 class ExecutorClient:
-    """WebSocket client for executing JavaScript in a remote browser."""
+    """WebSocket client for executing JavaScript in a remote browser.
+
+    Uses aiohttp ClientSession for WebSocket transport, which is safe
+    for concurrent send/recv from multiple asyncio tasks.
+    """
 
     def __init__(
         self,
@@ -99,13 +107,6 @@ class ExecutorClient:
         cert_path: tp.Optional[str] = None,
         key_path: tp.Optional[str] = None,
     ):
-        """
-        Args:
-            url: Executor URL (https://host:port). Defaults to EXECUTOR_URL env var.
-            ssl_verify: Verify SSL certs. False for self-signed.
-            cert_path: Client certificate PEM path.
-            key_path: Client key PEM path.
-        """
         config = ExecutorConfig(
             url=url, cert_path=cert_path, key_path=key_path, ssl_verify=ssl_verify,
         )
@@ -122,15 +123,15 @@ class ExecutorClient:
         path = parsed.path.rstrip("/") + "/client"
         self.ws_url = f"{ws_scheme}://{parsed.netloc}{path}"
 
-        self.ws: tp.Optional[tp.Any] = None
+        self.ws: tp.Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: tp.Optional[aiohttp.ClientSession] = None
+        self._send_lock = asyncio.Lock()
         self.pending_calls: dict = {}
         self.connected = False
         self.event_handlers: tp.Dict[str, tp.List[tp.Callable]] = {}
 
     async def connect(self):
         """Connect to the executor server."""
-        import ssl as sslmod
-
         ssl_ctx = None
         if self.ws_url.startswith("wss://"):
             ssl_ctx = sslmod.create_default_context()
@@ -148,10 +149,15 @@ class ExecutorClient:
                 except Exception as e:
                     logger.warning(f"Failed to load CA cert: {e}")
 
-        self.ws = await websockets.connect(self.ws_url, ssl=ssl_ctx)
+        # Create aiohttp session and connect
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+        self._session = aiohttp.ClientSession(connector=connector)
+        self.ws = await self._session.ws_connect(
+            self.ws_url,
+            heartbeat=30.0,  # aiohttp built-in ping/pong keepalive
+        )
         asyncio.create_task(self._handle_messages())
         await asyncio.sleep(0.2)
-        await self.ws.ping()
         self.connected = True
         logger.info(f"Connected to {self.ws_url}")
 
@@ -159,53 +165,57 @@ class ExecutorClient:
         """Handle incoming messages from server."""
         assert self.ws is not None
         try:
-            async for message in self.ws:
-                data = json.loads(message)
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
 
-                if data["type"] == "result":
-                    call_id = data["id"]
-                    if call_id in self.pending_calls:
-                        future = self.pending_calls.pop(call_id)
-                        if data["success"]:
-                            future.set_result(data.get("result"))
-                        else:
-                            future.set_exception(Exception(data.get("error", "Unknown error")))
+                    if data["type"] == "result":
+                        call_id = data["id"]
+                        if call_id in self.pending_calls:
+                            future = self.pending_calls.pop(call_id)
+                            if data["success"]:
+                                future.set_result(data.get("result"))
+                            else:
+                                future.set_exception(Exception(data.get("error", "Unknown error")))
 
-                elif data["type"] == "event":
-                    event_type = data.get("eventType")
-                    event_data = data.get("data", {})
-                    if event_type:
-                        asyncio.create_task(self._dispatch_event(event_type, event_data))
+                    elif data["type"] == "event":
+                        event_type = data.get("eventType")
+                        event_data = data.get("data", {})
+                        if event_type:
+                            asyncio.create_task(self._dispatch_event(event_type, event_data))
 
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"WebSocket closed: {e}")
-            self.connected = False
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error: {self.ws.exception()}")
+                    break
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                    break
+
         except Exception as e:
             logger.error(f"Message handler error: {e}")
+        finally:
             self.connected = False
+            logger.warning("WebSocket message handler exited")
+
+    async def _send(self, data: dict):
+        """Send a JSON message, serialized through the send lock."""
+        assert self.ws is not None, "Not connected"
+        async with self._send_lock:
+            await self.ws.send_json(data)
 
     async def exec(self, code: str, timeout: float = 30.0) -> tp.Any:
-        """Execute JavaScript in the remote browser.
-
-        Args:
-            code: JavaScript code to execute.
-            timeout: Timeout in seconds.
-
-        Returns:
-            Result from JavaScript execution.
-        """
+        """Execute JavaScript in the remote browser."""
         assert self.ws is not None, "Not connected"
 
         call_id = str(uuid.uuid4())
         future: asyncio.Future = asyncio.Future()
         self.pending_calls[call_id] = future
 
-        await self.ws.send(json.dumps({
+        await self._send({
             "type": "exec",
             "id": call_id,
             "code": code,
             "timeout": timeout,
-        }))
+        })
 
         try:
             return await asyncio.wait_for(future, timeout=timeout + 5)
@@ -225,8 +235,7 @@ class ExecutorClient:
 
     async def navigate(self, url: str):
         """Navigate browser to URL."""
-        assert self.ws is not None, "Not connected"
-        await self.ws.send(json.dumps({"type": "navigate", "url": url}))
+        await self._send({"type": "navigate", "url": url})
 
     def on(self, event_type: str, handler: tp.Callable) -> None:
         """Register an event handler for browser events."""
@@ -261,15 +270,10 @@ class ExecutorClient:
 
     async def add_init(self, code: str) -> None:
         """Register initialization code (runs on browser connect/reconnect)."""
-        assert self.ws is not None, "Not connected"
-        await self.ws.send(json.dumps({"type": "add_init", "code": code}))
+        await self._send({"type": "add_init", "code": code})
 
     async def enable_console_tap(self) -> None:
-        """Install console log interception in the browser.
-
-        Forwards console.log/warn/error/etc. as 'console' events.
-        Register a handler with: client.on('console', handler)
-        """
+        """Install console log interception in the browser."""
         await self.add_init(_CONSOLE_TAP_JS)
         await self.exec(_CONSOLE_TAP_JS)
 
@@ -277,7 +281,11 @@ class ExecutorClient:
         """Close the connection."""
         if self.ws:
             await self.ws.close()
-            self.connected = False
+            self.ws = None
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self.connected = False
 
     async def __aenter__(self):
         await self.connect()
