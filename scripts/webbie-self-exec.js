@@ -51,25 +51,29 @@
     });
   }
 
-  // Type text into ProseMirror and send it
+  // Type text into editor and send it (TipTap API with execCommand fallback)
   function sendToChat(text) {
-    const editor = document.querySelector('div.ProseMirror');
-    if (!editor) { console.warn('[self-exec] No ProseMirror editor'); return false; }
+    const pm = document.querySelector('div.ProseMirror');
+    if (!pm) { console.warn('[self-exec] No ProseMirror editor'); return false; }
 
-    editor.focus();
-    document.execCommand('selectAll');
-    document.execCommand('delete');
-    document.execCommand('insertText', false, text);
+    const ed = pm.editor;
+    if (ed && ed.commands) {
+      ed.commands.clearContent();
+      ed.commands.insertContent(text);
+    } else {
+      pm.focus();
+      document.execCommand('selectAll');
+      document.execCommand('delete');
+      document.execCommand('insertText', false, text);
+    }
 
-    // Click send button after a brief delay for ProseMirror to process
     setTimeout(() => {
       const btn = document.querySelector('button[aria-label="Send message"]')
                 || document.querySelector('button[aria-label="Send Message"]');
       if (btn && !btn.disabled) {
         btn.click();
       } else {
-        // Fallback: Enter key
-        editor.dispatchEvent(new KeyboardEvent('keydown', {
+        pm.dispatchEvent(new KeyboardEvent('keydown', {
           key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
           bubbles: true, cancelable: true
         }));
