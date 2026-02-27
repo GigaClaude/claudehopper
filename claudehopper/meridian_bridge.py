@@ -515,7 +515,6 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                                meridian_url: str, poll_interval: float = 15.0):
     """Poll chat DOM for new assistant messages containing meridian_cmd JSON blocks."""
     processed_cmds: set[str] = set()
-    send_lock = asyncio.Lock()
     logger.info(f"DOM command watcher started (polling every {poll_interval}s)")
 
     # Snapshot existing DOM — mark all current commands as already processed
@@ -576,18 +575,6 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
 
                     result = await _execute_meridian_cmd(http, meridian_url, cmd)
                     logger.info(f"[DOM-CMD] Result: {result[:200]}")
-
-                    # Send result back via ProseMirror
-                    from .comms import BrowserComms
-                    reply = f"[AUTO-RELAY] {action} -> {result[:1500]}"
-                    async with send_lock:
-                        try:
-                            async with BrowserComms() as comms:
-                                await comms.send(reply)
-                            logger.info(f"[DOM-CMD] Result sent back to chat")
-                        except Exception as e:
-                            logger.warning(f"[DOM-CMD] Failed to send result: {e}")
-
                     processed_cmds.add(cmd_hash)
 
         except Exception as e:
