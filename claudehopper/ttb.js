@@ -224,6 +224,19 @@ class TTB {
       }
     });
 
+    // Start a drain loop — checks every 2s
+    this._drainTimer = setInterval(() => {
+      if (this.paused) return;
+      if (this._flushing) return;
+      if (this.isStreaming()) return;
+      if (this.getInput().trim()) return;  // human typing
+      if (!this.inbox.length) return;
+
+      this._flushing = true;
+      this.send(this.inbox.shift());
+      setTimeout(() => { this._flushing = false; }, 3000);  // cooldown
+    }, 2000);
+
     document.title = '\u25B6 LIVE';
   }
 
@@ -231,6 +244,10 @@ class TTB {
     if (this._observer) {
       this._observer.disconnect();
       this._observer = null;
+    }
+    if (this._drainTimer) {
+      clearInterval(this._drainTimer);
+      this._drainTimer = null;
     }
     this._seen.clear();
     this.outbox.length = 0;
