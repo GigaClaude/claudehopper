@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import time
 
 import aiohttp
 
@@ -84,6 +85,16 @@ window.bridge = {
             type: type,
         });
         console.log('[bridge] Sent to Giga:', message.slice(0, 60));
+    },
+
+    sendToChannel(message) {
+        window._remote.emit('bridge_msg', {
+            from: 'webbie',
+            to: 'channel',
+            content: message,
+            type: 'channel',
+        });
+        console.log('[bridge] Sent to channel:', message.slice(0, 60));
     },
 
     onMessage(callback) {
@@ -195,16 +206,33 @@ async def handle_meridian_event(client: ExecutorClient, http: aiohttp.ClientSess
 _giga_inbox: list[dict] = []
 
 
-def handle_bridge_msg(event_data: dict):
-    """Handle a bridge message from browser Claude."""
-    msg = {
-        "from": event_data.get("from", "unknown"),
-        "to": event_data.get("to", "unknown"),
-        "content": event_data.get("content", ""),
-        "type": event_data.get("type", "text"),
-    }
-    _giga_inbox.append(msg)
-    logger.info(f"[BRIDGE] {msg['from']} -> {msg['to']}: {msg['content'][:80]}")
+def make_bridge_msg_handler(http: "aiohttp.ClientSession", meridian_url: str):
+    """Create bridge message handler with HTTP session for channel forwarding."""
+
+    async def handle_bridge_msg(event_data: dict):
+        """Handle a bridge message from browser Claude."""
+        msg = {
+            "from": event_data.get("from", "unknown"),
+            "to": event_data.get("to", "unknown"),
+            "content": event_data.get("content", ""),
+            "type": event_data.get("type", "text"),
+        }
+        _giga_inbox.append(msg)
+        logger.info(f"[BRIDGE] {msg['from']} -> {msg['to']}: {msg['content'][:80]}")
+
+        # Forward channel-type messages to Meridian channel API
+        if msg["to"] == "channel" or msg["type"] == "channel":
+            try:
+                async with http.post(
+                    f"{meridian_url}/api/channel/send",
+                    json={"sender": msg["from"], "content": msg["content"]},
+                ) as resp:
+                    data = await resp.json()
+                    logger.info(f"[BRIDGE->CHANNEL] {msg['from']}: {msg['content'][:60]} (msg #{data.get('count', '?')})")
+            except Exception as e:
+                logger.warning(f"[BRIDGE->CHANNEL] Forward failed: {e}")
+
+    return handle_bridge_msg
 
 
 async def send_to_browser(client: ExecutorClient, message: str, msg_type: str = "text"):
@@ -265,6 +293,16 @@ async def _execute_meridian_cmd(http: aiohttp.ClientSession, meridian_url: str,
             }) as resp:
                 data = await resp.json()
                 return f"Checkpoint: {data.get('checkpoint_id', 'unknown')}"
+
+        elif action == "channel_send":
+            content = cmd.get("content", "")
+            sender = cmd.get("sender", "webbie")
+            async with http.post(f"{meridian_url}/api/channel/send", json={
+                "sender": sender,
+                "content": content,
+            }) as resp:
+                data = await resp.json()
+                return f"Posted to channel (msg #{data.get('count', '?')})" if data.get("ok") else f"Failed: {data}"
 
         else:
             return f"Unknown command: {action}"
@@ -353,6 +391,58 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
             logger.error(f"DOM watcher error: {e}")
 
 
+async def channel_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
+                           meridian_url: str, poll_interval: float = 3.0):
+    """Poll the IRC channel for new messages and push them to the browser.
+
+    This bridges the gap between the IRC channel (Meridian web server) and
+    Webbie's browser tab. Without this, channel messages only go to WebSocket
+    subscribers on the channel.html page — Webbie never sees them.
+    """
+    last_ts: float = time.time()  # Only forward messages after we start
+    logger.info(f"Channel watcher started (polling every {poll_interval}s, since ts={last_ts:.0f})")
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+
+            async with http.get(
+                f"{meridian_url}/api/channel/history",
+                params={"since": str(last_ts), "limit": "50"},
+            ) as resp:
+                data = await resp.json()
+
+            messages = data.get("messages", [])
+            if not messages:
+                continue
+
+            for msg in messages:
+                sender = msg.get("sender", "unknown")
+                content = msg.get("content", "")
+                ts = msg.get("ts", 0)
+
+                # Skip messages from webbie to avoid echo loops
+                if sender.lower() == "webbie":
+                    continue
+
+                # Push to browser via bridge._receive()
+                try:
+                    await send_to_browser(
+                        client,
+                        f"[#{sender}] {content}",
+                        msg_type="channel",
+                    )
+                    logger.info(f"[CHANNEL->BROWSER] {sender}: {content[:60]}")
+                except Exception as e:
+                    logger.warning(f"[CHANNEL->BROWSER] Failed to push: {e}")
+
+                if ts > last_ts:
+                    last_ts = ts
+
+        except Exception as e:
+            logger.debug(f"Channel watcher error (retrying): {e}")
+
+
 async def main():
     inject_only = "--inject" in sys.argv
     meridian_url = os.environ.get("MERIDIAN_URL", MERIDIAN_URL)
@@ -375,11 +465,12 @@ async def main():
         await handle_meridian_event(client, http, meridian_url, event_data)
 
     client.on("meridian", on_meridian)
-    client.on("bridge_msg", handle_bridge_msg)
+    client.on("bridge_msg", make_bridge_msg_handler(http, meridian_url))
 
     watcher_task = asyncio.create_task(dom_command_watcher(client, http, meridian_url))
+    channel_task = asyncio.create_task(channel_watcher(client, http, meridian_url))
 
-    logger.info("Event handlers registered. DOM watcher started. Listening...")
+    logger.info("Event handlers registered. DOM watcher + channel watcher started. Listening...")
 
     try:
         while True:
@@ -388,6 +479,7 @@ async def main():
         pass
     finally:
         watcher_task.cancel()
+        channel_task.cancel()
         await http.close()
         await client.close()
         logger.info("Bridge shutdown")

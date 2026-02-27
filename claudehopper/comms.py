@@ -97,9 +97,21 @@ def _make_insert_and_send_js(message: str) -> str:
 
     Combines insert + send into a single exec call to avoid the race
     condition where the send button isn't ready between two separate calls.
+    Waits for any active streaming to finish before inserting.
     """
     safe = json.dumps(message)
     return f"""
+// Wait for any active streaming to complete (stop button present = streaming)
+const isStreaming = () => !!document.querySelector('button[aria-label="Stop response"]')
+    || !!document.querySelector('button[aria-label="Stop Response"]')
+    || !!document.querySelector('[data-is-streaming="true"]');
+
+let streamWait = 0;
+while (isStreaming() && streamWait < 60) {{
+    await new Promise(r => setTimeout(r, 500));
+    streamWait++;
+}}
+
 const e = document.querySelector("div.ProseMirror");
 if (!e) return JSON.stringify({{ok: false, error: "no editor"}});
 e.focus();
