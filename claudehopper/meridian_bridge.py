@@ -279,9 +279,24 @@ async def _execute_meridian_cmd(http: aiohttp.ClientSession, meridian_url: str,
         elif action == "briefing":
             project_id = cmd.get("project_id", "default")
             async with http.get(f"{meridian_url}/api/memory/briefing",
-                               params={"project_id": project_id}) as resp:
+                               params={"project_id": project_id},
+                               timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 data = await resp.json()
-                return str(data.get("briefing", data))[:2000]
+                briefing = str(data.get("briefing", data))
+                # Briefing can be 6k+ chars — too large for DOM injection.
+                # Extract high-signal lines only: task state, warnings, next steps.
+                lines = briefing.split("\n")
+                summary_lines = []
+                for line in lines:
+                    s = line.strip().strip('"').strip(",").strip()
+                    if any(k in s.lower() for k in [
+                        '"task":', '"warnings":', '"next_steps":', '"active_warnings":',
+                        "[high]", "[med]",
+                    ]) or (s.startswith('"') and ":" in s and len(s) < 120):
+                        summary_lines.append(s)
+                if summary_lines:
+                    return f"BRIEFING ({len(briefing)} chars):\n" + "\n".join(summary_lines[:20])
+                return f"BRIEFING ({len(briefing)} chars):\n{briefing[:800]}"
 
         elif action == "checkpoint":
             async with http.post(f"{meridian_url}/api/memory/checkpoint", json={
