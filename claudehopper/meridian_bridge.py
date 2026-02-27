@@ -513,11 +513,16 @@ async def handle_cmd_event(client: ExecutorClient, http: aiohttp.ClientSession,
 
 async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
                                meridian_url: str, poll_interval: float = 15.0):
-    """Poll chat DOM for new assistant messages containing meridian_cmd JSON blocks."""
+    """Poll chat DOM for new assistant messages.
+
+    1. Auto-execute meridian_cmd JSON blocks
+    2. Auto-relay new Webbie assistant text to the IRC channel
+    """
     processed_cmds: set[str] = set()
+    relayed_hashes: set[str] = set()
     logger.info(f"DOM command watcher started (polling every {poll_interval}s)")
 
-    # Snapshot existing DOM — mark all current commands as already processed
+    # Snapshot existing DOM — mark current state as already seen
     try:
         raw = await client.exec(_READ_CHAT_JS, timeout=10)
         if raw:
@@ -526,10 +531,11 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                 if msg.get("role") != "assistant":
                     continue
                 text = msg.get("text", "")
+                relayed_hashes.add(hashlib.md5(text[:500].encode()).hexdigest())
                 for match in _CMD_RE.finditer(text):
                     cmd_hash = hashlib.md5(match.group().encode()).hexdigest()
                     processed_cmds.add(cmd_hash)
-            logger.info(f"[DOM-CMD] Baseline: {len(processed_cmds)} cmds marked seen")
+            logger.info(f"[DOM-CMD] Baseline: {len(processed_cmds)} cmds, {len(relayed_hashes)} msgs marked seen")
     except Exception as e:
         logger.warning(f"[DOM-CMD] Failed to snapshot baseline: {e}")
 
@@ -576,6 +582,46 @@ async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSessio
                     result = await _execute_meridian_cmd(http, meridian_url, cmd)
                     logger.info(f"[DOM-CMD] Result: {result[:200]}")
                     processed_cmds.add(cmd_hash)
+
+                # --- Auto-relay new assistant text to channel ---
+                msg_hash = hashlib.md5(text[:500].encode()).hexdigest()
+                if msg_hash in relayed_hashes:
+                    continue
+                if msg.get("streaming"):
+                    continue
+                relayed_hashes.add(msg_hash)
+
+                # Skip injected relay results and short messages
+                if text.startswith("[#") or len(text.strip()) < 10:
+                    continue
+
+                # Strip meridian_cmd blocks from relay text
+                relay_text = _CMD_RE.sub("", text).strip()
+                if len(relay_text) < 10:
+                    continue
+
+                # Skip DOM artifacts (thinking indicators, garbled scrapes)
+                if relay_text.startswith("Thinking about "):
+                    continue
+                prefix = relay_text[:30]
+                if len(prefix) >= 20 and relay_text.count(prefix) >= 2:
+                    continue
+
+                try:
+                    async with http.post(
+                        f"{meridian_url}/api/channel/send",
+                        json={"sender": "webbie", "content": relay_text[:4000]},
+                    ) as resp:
+                        data = await resp.json()
+                        logger.info(f"[WEBBIE->CHANNEL] Relayed {len(relay_text)} chars (msg #{data.get('count', '?')})")
+                except Exception as e:
+                    logger.warning(f"[WEBBIE->CHANNEL] Relay failed: {e}")
+
+            # Cap memory growth
+            if len(relayed_hashes) > 200:
+                excess = len(relayed_hashes) - 100
+                for _ in range(excess):
+                    relayed_hashes.pop()
 
         except Exception as e:
             logger.error(f"DOM watcher error: {e}")
