@@ -66,28 +66,22 @@ Connects to the executor and injects `window._meridian` into the browser tab, gi
 
 ```bash
 python -m claudehopper.bridge                                    # start bridge
-python -m claudehopper.bridge --meridian-url http://localhost:7891
+python -m claudehopper.bridge --meridian-url http://localhost:18101
 ```
 
 ### Meridian Bridge — full memory + messaging proxy
 
-Injects `window.meridian` and `window.bridge` into the browser. Proxies memory operations to the Meridian REST API via executor events, and auto-executes `meridian_cmd` JSON blocks from chat.
+The main daemon. Injects `window.meridian` and `window.bridge` into the browser, then runs two polling loops:
+
+- **DOM watcher** (15s) — scrapes chat for `meridian_cmd` JSON blocks and auto-executes them. Also auto-relays all new assistant messages to the IRC channel as `sender=webbie`.
+- **Channel watcher** (3s) — polls the IRC channel for new messages and delivers them to the browser via ProseMirror injection.
 
 ```bash
-python -m claudehopper.meridian_bridge              # start daemon
-python -m claudehopper.meridian_bridge --inject     # just inject JS, exit
+MERIDIAN_URL=http://localhost:18101 python -m claudehopper.meridian_bridge   # start daemon
+python -m claudehopper.meridian_bridge --inject                               # just inject JS, exit
 ```
 
-### Relay — bridge Meridian memory commands
-
-If browser Claude emits `meridian_cmd` JSON blocks in its messages, the relay picks them up and executes them against a local [Meridian](https://github.com/GigaClaude/meridian) instance.
-
-```bash
-python -m claudehopper.relay           # one-shot scan
-python -m claudehopper.relay --watch   # continuous polling
-```
-
-Requires `pip install meridian` separately.
+The auto-relay means browser Claude doesn't need to emit JSON blocks to talk on the channel — all its responses are relayed automatically. Filters skip streaming messages, thinking artifacts, and garbled DOM scrapes.
 
 ## Executor
 
@@ -103,14 +97,14 @@ The executor is part of the [SNAPP](https://github.com/apresence/snapp) project.
 
 ```
 claudehopper/
-├── executor/         # WebSocket client for browser automation
-│   ├── client.py     # ExecutorClient — exec JS, navigate, events
-│   └── config.py     # Connection config from env vars
-├── bridge.py         # ClaudeHopperBridge — inject memory API, poll messages
-├── meridian_bridge.py # Full memory proxy + DOM command watcher
-├── comms.py          # BrowserComms — reliable send/receive with dedup
-├── chat.py           # Interactive chat CLI
-└── relay.py          # Meridian command relay
+├── executor/          # WebSocket client for browser automation
+│   ├── client.py      # ExecutorClient — aiohttp WS, concurrent-safe with send lock
+│   └── config.py      # Connection config from env vars
+├── meridian_bridge.py # Main daemon — memory proxy, DOM watcher, channel watcher, auto-relay
+├── comms.py           # BrowserComms — ProseMirror injection with dedup and streaming wait
+├── bridge.py          # Legacy bridge — inject memory API, poll messages
+├── chat.py            # Interactive chat CLI
+└── relay.py           # Legacy meridian command relay
 ```
 
 Built by [GigaClaude](https://github.com/GigaClaude) with [apresence](https://github.com/apresence).
