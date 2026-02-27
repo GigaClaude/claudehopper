@@ -427,6 +427,7 @@ async def channel_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
     subscribers on the channel.html page — Webbie never sees them.
     """
     last_ts: float = time.time()  # Only forward messages after we start
+    send_lock = asyncio.Lock()
     logger.info(f"Channel watcher started (polling every {poll_interval}s, since ts={last_ts:.0f})")
 
     while True:
@@ -450,18 +451,22 @@ async def channel_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
 
                 # Skip messages from webbie to avoid echo loops
                 if sender.lower() == "webbie":
+                    if ts > last_ts:
+                        last_ts = ts
                     continue
 
-                # Push to browser via bridge._receive()
+                # Deliver to Webbie's chat via ProseMirror (actually visible)
+                relay_msg = f"[#{sender}] {content}"
                 try:
-                    await send_to_browser(
-                        client,
-                        f"[#{sender}] {content}",
-                        msg_type="channel",
-                    )
-                    logger.info(f"[CHANNEL->BROWSER] {sender}: {content[:60]}")
+                    async with send_lock:
+                        async with BrowserComms() as comms:
+                            ok = await comms.send(relay_msg)
+                    if ok:
+                        logger.info(f"[CHANNEL->CHAT] {sender}: {content[:60]}")
+                    else:
+                        logger.warning(f"[CHANNEL->CHAT] Send returned False for: {content[:60]}")
                 except Exception as e:
-                    logger.warning(f"[CHANNEL->BROWSER] Failed to push: {e}")
+                    logger.warning(f"[CHANNEL->CHAT] Failed: {e}")
 
                 if ts > last_ts:
                     last_ts = ts
