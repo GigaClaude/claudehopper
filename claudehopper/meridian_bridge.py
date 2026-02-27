@@ -113,9 +113,98 @@ window.bridge = {
     },
 };
 
-console.log('[meridian_bridge] Memory and bridge methods injected.');
-console.log('[meridian_bridge] Available: window.meridian.recall(), .remember(), .briefing(), .forget()');
-console.log('[meridian_bridge] Available: window.bridge.sendToGiga(), .onMessage(), .getInbox()');
+// ── Self-Exec: watch for { "js_cmd": "..." } in assistant messages, execute directly ──
+(function() {
+  if (window._selfExec) return;
+  window._selfExec = { processed: new Set(), results: {} };
+
+  const CMD_RE = /\{\s*"js_cmd"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+
+  function getNonce() {
+    const s = document.querySelector('script[nonce]');
+    return s ? s.nonce || s.getAttribute('nonce') : '';
+  }
+
+  function execJS(code) {
+    return new Promise((resolve) => {
+      const id = '_se_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+      const wrapped = `(async()=>{try{const __r=await(async function(){${code}})();window._selfExec.results['${id}']={ok:true,value:__r}}catch(e){window._selfExec.results['${id}']={ok:false,error:e.message}}})();`;
+      const el = document.createElement('script');
+      el.nonce = getNonce();
+      el.textContent = wrapped;
+      document.head.appendChild(el);
+      el.remove();
+      let tries = 0;
+      const poll = setInterval(() => {
+        const r = window._selfExec.results[id];
+        if (r || tries++ > 100) {
+          clearInterval(poll);
+          delete window._selfExec.results[id];
+          resolve(r || { ok: false, error: 'timeout' });
+        }
+      }, 50);
+    });
+  }
+
+  function sendToChat(text) {
+    const editor = document.querySelector('div.ProseMirror');
+    if (!editor) return;
+    editor.focus();
+    document.execCommand('selectAll');
+    document.execCommand('delete');
+    document.execCommand('insertText', false, text);
+    setTimeout(() => {
+      const btn = document.querySelector('button[aria-label="Send message"]')
+              || document.querySelector('button[aria-label="Send Message"]');
+      if (btn && !btn.disabled) { btn.click(); return; }
+      editor.dispatchEvent(new KeyboardEvent('keydown', {
+        key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true
+      }));
+    }, 200);
+  }
+
+  function getLastAssistantText() {
+    const msgs = document.querySelectorAll('[data-is-streaming]');
+    const containers = msgs.length > 0 ? Array.from(msgs) : Array.from(document.querySelectorAll('div.grid.grid-cols-1'));
+    for (let i = containers.length - 1; i >= 0; i--) {
+      const el = containers[i];
+      const isUser = el.className.includes('font-user-message') || el.className.includes('!font-user');
+      const isStreaming = el.getAttribute('data-is-streaming') === 'true';
+      if (!isUser && !isStreaming) return el.textContent.trim();
+    }
+    return '';
+  }
+
+  async function scan() {
+    const text = getLastAssistantText();
+    if (!text) return;
+    CMD_RE.lastIndex = 0;
+    let match;
+    while ((match = CMD_RE.exec(text)) !== null) {
+      const raw = match[0];
+      const hash = raw.length + '_' + raw.slice(0, 40);
+      if (window._selfExec.processed.has(hash)) continue;
+      window._selfExec.processed.add(hash);
+      const code = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+      console.log('[self-exec] Run:', code.slice(0, 80));
+      const result = await execJS(code);
+      const output = result.ok ? String(result.value === undefined ? '(undefined)' : result.value) : 'ERROR: ' + result.error;
+      console.log('[self-exec] Result:', output.slice(0, 200));
+      sendToChat('[js_cmd result] ' + output.slice(0, 3000));
+      break;
+    }
+  }
+
+  const observer = new MutationObserver(() => {
+    clearTimeout(window._selfExec._debounce);
+    window._selfExec._debounce = setTimeout(scan, 2000);
+  });
+  observer.observe(document.querySelector('main') || document.body, { childList: true, subtree: true, characterData: true });
+  setInterval(scan, 10000);
+  console.log('[self-exec] Active. Watching for { "js_cmd": "..." } in assistant messages.');
+})();
+
+console.log('[meridian_bridge] Memory, bridge, and self-exec injected.');
 """
 
 # Regex for meridian_cmd JSON blocks in chat text
