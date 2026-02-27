@@ -79,29 +79,34 @@ return JSON.stringify(messages.slice(-15));
 
 
 def _make_send_js(message: str) -> str:
-    """JS to insert text into ProseMirror editor via execCommand."""
+    """JS to insert text into editor via TipTap API (fallback: execCommand)."""
     safe = json.dumps(message)
     return f"""
-const e = document.querySelector("div.ProseMirror");
-if (!e) return JSON.stringify({{ok: false, error: "no editor"}});
-e.focus();
+const pm = document.querySelector("div.ProseMirror");
+if (!pm) return JSON.stringify({{ok: false, error: "no editor"}});
+const editor = pm.editor;
+if (editor && editor.commands) {{
+    editor.commands.clearContent();
+    editor.commands.insertContent({safe});
+    return JSON.stringify({{ok: true, method: "tiptap", preview: pm.textContent.slice(0, 80)}});
+}}
+// Fallback: legacy execCommand
+pm.focus();
 document.execCommand("selectAll");
 document.execCommand("delete");
 document.execCommand("insertText", false, {safe});
-return JSON.stringify({{ok: true, preview: e.textContent.slice(0, 80)}});
+return JSON.stringify({{ok: true, method: "execCommand", preview: pm.textContent.slice(0, 80)}});
 """
 
 
 def _make_insert_and_send_js(message: str) -> str:
-    """JS to insert text AND click send in one shot with retry.
+    """JS to insert text AND click send. Uses TipTap API with execCommand fallback.
 
-    Combines insert + send into a single exec call to avoid the race
-    condition where the send button isn't ready between two separate calls.
     Waits for any active streaming to finish before inserting.
     """
     safe = json.dumps(message)
     return f"""
-// Wait for any active streaming to complete (stop button present = streaming)
+// Wait for any active streaming to complete
 const isStreaming = () => !!document.querySelector('button[aria-label="Stop response"]')
     || !!document.querySelector('button[aria-label="Stop Response"]')
     || !!document.querySelector('[data-is-streaming="true"]');
@@ -112,14 +117,22 @@ while (isStreaming() && streamWait < 60) {{
     streamWait++;
 }}
 
-const e = document.querySelector("div.ProseMirror");
-if (!e) return JSON.stringify({{ok: false, error: "no editor"}});
-e.focus();
-document.execCommand("selectAll");
-document.execCommand("delete");
-document.execCommand("insertText", false, {safe});
+const pm = document.querySelector("div.ProseMirror");
+if (!pm) return JSON.stringify({{ok: false, error: "no editor"}});
 
-// Wait for ProseMirror to process and enable the send button
+// Insert text via TipTap API or fallback
+const editor = pm.editor;
+if (editor && editor.commands) {{
+    editor.commands.clearContent();
+    editor.commands.insertContent({safe});
+}} else {{
+    pm.focus();
+    document.execCommand("selectAll");
+    document.execCommand("delete");
+    document.execCommand("insertText", false, {safe});
+}}
+
+// Click send button
 const findBtn = () => document.querySelector('button[aria-label="Send message"]')
     || document.querySelector('button[aria-label="Send Message"]');
 
@@ -129,31 +142,29 @@ while (attempts < 20) {{
     const b = findBtn();
     if (b && !b.disabled) {{
         b.click();
-        return JSON.stringify({{ok: true, sent: true, preview: e.textContent.slice(0, 80)}});
+        const method = (editor && editor.commands) ? "tiptap" : "execCommand";
+        return JSON.stringify({{ok: true, sent: true, method, preview: pm.textContent.slice(0, 80)}});
     }}
     attempts++;
 }}
 
-// Button click failed — try Enter key on the editor as fallback
-// Many chat UIs submit on Enter, bypassing the button entirely
-e.focus();
-e.dispatchEvent(new KeyboardEvent("keydown", {{
+// Fallback: Enter key
+pm.focus();
+pm.dispatchEvent(new KeyboardEvent("keydown", {{
     key: "Enter", code: "Enter", keyCode: 13, which: 13,
     bubbles: true, cancelable: true
 }}));
 await new Promise(r => setTimeout(r, 300));
 
-// Check if the text was cleared (indicating submit worked)
-if (!e.textContent || e.textContent.trim().length === 0) {{
+if (!pm.textContent || pm.textContent.trim().length === 0) {{
     return JSON.stringify({{ok: true, sent: true, method: "enter_key", preview: ""}});
 }}
 
-// Neither button nor Enter worked
 const b = findBtn();
 return JSON.stringify({{
     ok: true, sent: false,
     error: b ? (b.disabled ? "button stayed disabled" : "unknown") : "no button found",
-    preview: e.textContent.slice(0, 80)
+    preview: pm.textContent.slice(0, 80)
 }});
 """
 

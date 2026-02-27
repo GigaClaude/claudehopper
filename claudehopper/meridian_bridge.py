@@ -147,17 +147,23 @@ window.bridge = {
   }
 
   function sendToChat(text) {
-    const editor = document.querySelector('div.ProseMirror');
-    if (!editor) return;
-    editor.focus();
-    document.execCommand('selectAll');
-    document.execCommand('delete');
-    document.execCommand('insertText', false, text);
+    const pm = document.querySelector('div.ProseMirror');
+    if (!pm) return;
+    const ed = pm.editor;
+    if (ed && ed.commands) {
+      ed.commands.clearContent();
+      ed.commands.insertContent(text);
+    } else {
+      pm.focus();
+      document.execCommand('selectAll');
+      document.execCommand('delete');
+      document.execCommand('insertText', false, text);
+    }
     setTimeout(() => {
       const btn = document.querySelector('button[aria-label="Send message"]')
               || document.querySelector('button[aria-label="Send Message"]');
       if (btn && !btn.disabled) { btn.click(); return; }
-      editor.dispatchEvent(new KeyboardEvent('keydown', {
+      pm.dispatchEvent(new KeyboardEvent('keydown', {
         key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true
       }));
     }, 200);
