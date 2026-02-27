@@ -422,6 +422,70 @@ async def _execute_meridian_cmd(http: aiohttp.ClientSession, meridian_url: str,
         return f"Error: {e}"
 
 
+async def handle_cmd_event(client: ExecutorClient, http: aiohttp.ClientSession,
+                            meridian_url: str, cmd_data: dict):
+    """Handle 'cmd' events from TTB browser bridge.
+
+    Routes by key present in cmd_data:
+      meridian_cmd → Meridian REST API
+      bash_cmd     → shell execution
+      js_cmd       → inject JS back to browser
+    """
+    try:
+        if "meridian_cmd" in cmd_data:
+            logger.info(f"[CMD] meridian_cmd: {cmd_data['meridian_cmd']}")
+            result = await _execute_meridian_cmd(http, meridian_url, cmd_data)
+            # Send result back via TTB if available, else bridge
+            result_json = json.dumps({"type": "meridian_result", "result": result}, default=str)
+            result_escaped = result_json.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+            await client.exec(
+                f"if(window.tb){{window.tb.queueMsg('[meridian] '+{json.dumps(result[:1500])})}}",
+                timeout=5,
+            )
+
+        elif "bash_cmd" in cmd_data:
+            cmd_str = cmd_data["bash_cmd"]
+            timeout_s = min(cmd_data.get("timeout", 30), 120)  # Cap at 2 min
+            logger.info(f"[CMD] bash_cmd: {cmd_str[:80]} (timeout={timeout_s}s)")
+
+            proc = await asyncio.create_subprocess_shell(
+                cmd_str,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=os.path.expanduser("~"),
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+                output = stdout.decode("utf-8", errors="replace")[:4000]
+                exit_code = proc.returncode
+            except asyncio.TimeoutError:
+                proc.kill()
+                output = "(timed out)"
+                exit_code = -1
+
+            logger.info(f"[CMD] bash_cmd exit={exit_code}, {len(output)} chars")
+            result_msg = f"[bash exit={exit_code}] {output}"
+            await client.exec(
+                f"if(window.tb){{window.tb.queueMsg({json.dumps(result_msg[:2000])})}}",
+                timeout=5,
+            )
+
+        elif "js_cmd" in cmd_data:
+            code = cmd_data["js_cmd"]
+            logger.info(f"[CMD] js_cmd: {code[:80]}")
+            try:
+                result = await client.exec(code, timeout=cmd_data.get("timeout", 10))
+                logger.info(f"[CMD] js_cmd result: {str(result)[:200]}")
+            except Exception as e:
+                logger.error(f"[CMD] js_cmd error: {e}")
+
+        else:
+            logger.warning(f"[CMD] Unknown cmd keys: {list(cmd_data.keys())}")
+
+    except Exception as e:
+        logger.error(f"[CMD] Handler error: {e}")
+
+
 async def dom_command_watcher(client: ExecutorClient, http: aiohttp.ClientSession,
                                meridian_url: str, poll_interval: float = 15.0):
     """Poll chat DOM for new assistant messages. Two jobs:
@@ -692,6 +756,7 @@ async def main():
 
     client.on("meridian", on_meridian)
     client.on("bridge_msg", make_bridge_msg_handler(http, meridian_url))
+    client.on("cmd", lambda data: handle_cmd_event(client, http, meridian_url, data))
 
     watcher_task = asyncio.create_task(dom_command_watcher(client, http, meridian_url))
     channel_task = asyncio.create_task(channel_watcher(client, http, meridian_url))
